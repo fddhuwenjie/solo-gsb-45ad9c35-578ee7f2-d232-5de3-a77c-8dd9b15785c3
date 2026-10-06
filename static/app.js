@@ -21,6 +21,11 @@ let voyages = [];          // 航次列表（GET /api/voyages，新登记在前�
 // 用户录入后保留其值，发布号变化才重新预填
 let voyageDepSeq = null;
 let voyageDepDraft = "";
+// 航次改期：选中的未结束航次与所见原时刻（乐观并发基线）、新时刻输入草稿、
+// 最近一次被拒的原因与明细。被拒时输入保留，可修改后重新提交
+let rescheduleTarget = null; // {id, originalDepartureTime}
+let rescheduleDraft = "";
+let rescheduleErr = null;
 // 发布状态机：loading=尚未读到发布状态（页面可编辑但禁止一切工作区写请求）；
 // published=确认已有发布（禁飞区只存草稿、航线条件保存）；
 // none=确认从无发布（沿用原无条件自动保存）；error=读取失败（保留编辑、
@@ -1398,7 +1403,8 @@ function renderVoyageList() {
       ? `<span class="voyage-open">执行中</span>`
       : `<span class="voyage-ended">已结束 ${esc(v.endedAt)}</span>`;
     const btn = v.open
-      ? ` <button data-act="end" data-id="${v.id}" class="minor" style="padding:2px 8px;font-size:11px">结束航次</button>`
+      ? ` <button data-act="resched" data-id="${v.id}" class="minor" style="padding:2px 8px;font-size:11px">改期</button>` +
+        ` <button data-act="end" data-id="${v.id}" class="minor" style="padding:2px 8px;font-size:11px">结束航次</button>`
       : "";
     return `<div class="voyage-item${v.open ? " open" : ""}">
       <div class="vmeta">
@@ -1410,13 +1416,59 @@ function renderVoyageList() {
   box.querySelectorAll("[data-act='end']").forEach((b) => {
     b.onclick = () => endVoyage(+b.dataset.id);
   });
+  box.querySelectorAll("[data-act='resched']").forEach((b) => {
+    b.onclick = () => startReschedule(+b.dataset.id);
+  });
+}
+
+// 航次改期表单：选中未结束航次后展示；新时刻输入草稿与被拒明细都保留在页面
+function renderVoyageReschedule() {
+  const box = $("#voyageRescheduleBox");
+  if (!box) return;
+  if (!rescheduleTarget) { box.innerHTML = ""; return; }
+  const v = voyages.find((x) => x.id === rescheduleTarget.id);
+  let html = "";
+  if (rescheduleErr) {
+    html += `<div class="error-line">⚠ 改期被拒绝：${esc(rescheduleErr.error || "未知原因")}</div>`;
+    for (const e of rescheduleErr.errors || []) {
+      html += `<div class="error-line">⚠ ${esc(e.message)}</div>`;
+    }
+    for (const e of rescheduleErr.entries || []) {
+      html += `<div class="entry-line">✈ ${esc(e.nfzName)} · 航段${e.segIndex + 1} ·
+        ${fmtTime(e.enterTime)}→${fmtTime(e.exitTime)} · 高度 ${e.altLow}–${e.altHigh}m</div>`;
+    }
+    if (rescheduleErr.details) {
+      for (const [, val] of Object.entries(rescheduleErr.details)) {
+        html += `<div class="entry-line">原时刻：提交时 ${fmtTime(val.expected)} → 当前 ${fmtTime(val.actual)}</div>`;
+      }
+    }
+  }
+  html += `<div class="draft-card">
+    <div class="draft-head">改期航次 #${rescheduleTarget.id}${v ? `（发布 #${v.releaseSeq}）` : ""}</div>
+    <div class="summary">原起飞时刻 ${fmtTime(rescheduleTarget.originalDepartureTime)}：服务端保留航次编号、登记时间与原发布号，仅替换该航次航线快照中的起飞时刻，用当前已核准禁飞区重新审查。</div>
+    <div class="form-row" style="margin-top:6px">
+      <label>新起飞时刻</label>
+      <input type="datetime-local" id="rescheduleDep" step="60" style="flex:1;min-width:0"
+             value="${esc(rescheduleDraft)}">
+    </div>
+    <div class="draft-actions">
+      <button id="btnRescheduleSubmit">提交改期</button>
+      <button id="btnRescheduleCancel" class="minor">取消</button>
+    </div>
+  </div>`;
+  box.innerHTML = html;
+  const dep = $("#rescheduleDep");
+  dep.oninput = () => { rescheduleDraft = dep.value; };
+  $("#btnRescheduleSubmit").onclick = submitReschedule;
+  $("#btnRescheduleCancel").onclick = cancelReschedule;
 }
 
 function renderVoyages(err) {
   const root = $("#voyageBox");
   if (!root) return;
-  root.innerHTML = `<div id="voyageRegisterBox"></div><div id="voyageListBox" style="margin-top:8px"></div>`;
+  root.innerHTML = `<div id="voyageRegisterBox"></div><div id="voyageRescheduleBox" style="margin-top:8px"></div><div id="voyageListBox" style="margin-top:8px"></div>`;
   renderVoyageRegister(err);
+  renderVoyageReschedule();
   renderVoyageList();
 }
 
@@ -1460,6 +1512,68 @@ async function submitVoyageRegister() {
   toast("航次登记被拒绝：" + (r.error || "未知原因"));
 }
 
+// ----------------------------------------------------------- 航次改期
+// 侧栏选取未结束航次，输入新起飞时刻并携带所见原时刻提交；服务端仅替换该
+// 航次航线快照中的起飞时刻并用当前已核准禁飞区重审（即使已有新发布，也沿用
+// 该航次自己的航线几何）。被拒时原因与明细展示在表单上方，新时刻输入保留。
+function startReschedule(id) {
+  const v = voyages.find((x) => x.id === id);
+  if (!v || !v.open) return;
+  rescheduleTarget = { id: v.id, originalDepartureTime: v.departureTime };
+  rescheduleDraft = v.departureTime || "";
+  rescheduleErr = null;
+  renderVoyages();
+}
+
+function cancelReschedule() {
+  rescheduleTarget = null;
+  rescheduleDraft = "";
+  rescheduleErr = null;
+  renderVoyages();
+}
+
+async function submitReschedule() {
+  if (!rescheduleTarget) return;
+  const depVal = rescheduleDraft || "";
+  if (!depVal) {
+    rescheduleErr = { error: "请先填写新的起飞时刻" };
+    renderVoyageReschedule();
+    return;
+  }
+  const { id, originalDepartureTime } = rescheduleTarget;
+  let r;
+  try {
+    r = await api(`/api/voyages/${id}/reschedule`, {
+      method: "POST",
+      body: JSON.stringify({ departureTime: depVal, originalDepartureTime }),
+    });
+  } catch (e) {
+    rescheduleErr = { error: "改期请求失败：" + e };
+    renderVoyageReschedule();
+    return;
+  }
+  if (r.ok) {
+    toast(`航次 #${id} 已改期至 ${fmtTime(r.voyage.departureTime)}`);
+    rescheduleTarget = null;
+    rescheduleDraft = "";
+    rescheduleErr = null;
+    await loadVoyages();
+    return;
+  }
+  rescheduleErr = r;
+  if (r.reason === "stale" || r.reason === "voyage_not_found" || r.reason === "voyage_ended") {
+    // 原时刻被他页改动 / 航次已结束或不存在：同步最新航次列表；
+    // 航次仍未结束时采用最新原时刻作为下次提交基线，新时刻输入保留
+    try { await loadVoyages(); } catch (e) { /* 仍展示下方明细 */ }
+    const fresh = voyages.find((x) => x.id === id);
+    if (rescheduleTarget && fresh && fresh.open) {
+      rescheduleTarget.originalDepartureTime = fresh.departureTime;
+    }
+  }
+  renderVoyages();
+  toast("航次改期被拒绝：" + (r.error || "未知原因"));
+}
+
 async function endVoyage(id) {
   let r;
   try {
@@ -1470,6 +1584,11 @@ async function endVoyage(id) {
   }
   if (r.ok) {
     toast(`航次 #${id} 已结束，不再阻拦后续禁飞区核准`);
+    if (rescheduleTarget && rescheduleTarget.id === id) {
+      rescheduleTarget = null;
+      rescheduleDraft = "";
+      rescheduleErr = null;
+    }
     await loadVoyages();
   } else {
     toast("结束航次失败：" + (r.error || "未知原因"));

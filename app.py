@@ -821,6 +821,85 @@ def register_voyage():
     return jsonify({"ok": True, "voyage": voyage_dict(row)})
 
 
+@app.post("/api/voyages/<int:voyage_id>/reschedule")
+def reschedule_voyage(voyage_id):
+    """航次改期：保留航次编号、登记时间与原发布号，仅替换该航次保存的
+    航线快照中的起飞时刻。
+
+    提交 {departureTime, originalDepartureTime}：originalDepartureTime 为
+    页面所见原时刻，用于乐观并发——与库中保存值不一致即拒绝。全部检查在
+    单个 IMMEDIATE 事务内完成：航次不存在/已结束、原时刻已被他页改动、
+    新时刻无效、审查报错或冲突时整体回滚，原时刻与快照不变；通过时原子
+    更新同一航次的起飞时刻与航线快照。审查用当前工作区已核准禁飞区；
+    即使已有新发布，也沿用该航次自己保存的航线几何（快照仅换起飞时刻）。
+    改期与结束/核准交错时，SQLite 写事务串行使核准始终读到最终生效的
+    未结束航次，不漏检。
+    """
+    body = request.get_json(force=True, silent=True) or {}
+    if "originalDepartureTime" not in body:
+        return jsonify({"ok": False, "reason": "missing_fields",
+                        "error": "必须提交所见原时刻 originalDepartureTime"}), 400
+    orig_raw = body.get("originalDepartureTime")
+    dep_raw = body.get("departureTime")
+    dep = parse_dt(dep_raw)
+    if not isinstance(dep_raw, str) or dep is None:
+        return jsonify({"ok": False, "reason": "invalid_departure_time",
+                        "error": "新起飞时刻缺失或格式错误"}), 400
+    orig = parse_dt(orig_raw) if isinstance(orig_raw, str) else None
+
+    db = get_db()
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        row = db.execute("SELECT * FROM voyages WHERE id=?", (voyage_id,)).fetchone()
+        if row is None:
+            db.rollback()
+            return jsonify({"ok": False, "reason": "voyage_not_found",
+                            "error": f"航次 {voyage_id} 不存在"}), 404
+        if row["ended_at"] is not None:
+            db.rollback()
+            return jsonify({"ok": False, "reason": "voyage_ended",
+                            "error": f"航次 {voyage_id} 已结束，不能改期"}), 409
+        # 乐观并发：所见原时刻须与库中保存的一致（无法解析的原时刻视同不一致）
+        stored = row["departure_time"]
+        if orig is None or fmt_dt(orig) != stored:
+            db.rollback()
+            return jsonify({"ok": False, "reason": "stale",
+                            "error": "原起飞时刻已在他处变更，请刷新后重试",
+                            "details": {"departureTime": {
+                                "expected": orig_raw, "actual": stored}}}), 409
+
+        # 该航次自己保存的航线快照（几何/速度/走廊等不动），仅替换起飞时刻
+        route = json.loads(row["route_snapshot"])
+        route["departureTime"] = fmt_dt(dep)
+        ws_row = db.execute("SELECT v FROM kv WHERE k='state'").fetchone()
+        ws_state = json.loads(ws_row["v"]) if ws_row else {}
+        combined = {"route": route, "nfzs": ws_state.get("nfzs") or []}
+
+        result = analyze(combined)
+        if result["errors"]:
+            db.rollback()
+            return jsonify({"ok": False, "reason": "analysis_errors",
+                            "error": "审查存在错误，航次未改期",
+                            "errors": result["errors"]}), 400
+        if result["entries"]:
+            db.rollback()
+            return jsonify({"ok": False, "reason": "analysis_conflicts",
+                            "error": f"审查发现 {len(result['entries'])} 处冲突，航次未改期",
+                            "entries": result["entries"],
+                            "first": result["first"]}), 409
+
+        db.execute(
+            "UPDATE voyages SET departure_time=?, route_snapshot=? WHERE id=?",
+            (fmt_dt(dep), json.dumps(route, ensure_ascii=False), voyage_id),
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    row = db.execute("SELECT * FROM voyages WHERE id=?", (voyage_id,)).fetchone()
+    return jsonify({"ok": True, "voyage": voyage_dict(row)})
+
+
 @app.post("/api/voyages/<int:voyage_id>/end")
 def end_voyage(voyage_id):
     """结束航次：幂等标记 ended_at；结束后该航次不再阻拦禁飞区核准。"""
