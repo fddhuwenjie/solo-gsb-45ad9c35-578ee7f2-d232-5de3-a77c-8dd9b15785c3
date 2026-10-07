@@ -21,6 +21,11 @@ let voyages = [];          // 航次列表（GET /api/voyages，新登记在前�
 // 用户录入后保留其值，发布号变化才重新预填
 let voyageDepSeq = null;
 let voyageDepDraft = "";
+// 改期表单草稿：侧栏选取未结束航次（rescheduleId），填入新起飞时刻，
+// 提交时带上所见原时刻（该航次当前 departureTime）。被拒后输入与选中项保留。
+let rescheduleId = null;
+let rescheduleDepDraft = "";
+let rescheduleErr = null;
 // 发布状态机：loading=尚未读到发布状态（页面可编辑但禁止一切工作区写请求）；
 // published=确认已有发布（禁飞区只存草稿、航线条件保存）；
 // none=确认从无发布（沿用原无条件自动保存）；error=读取失败（保留编辑、
@@ -1318,10 +1323,13 @@ function discardNfzDraft() {
   toast("已放弃禁飞区草稿");
 }
 
-// ----------------------------------------------------------- 航次登记
+// ----------------------------------------------------------- 航次登记 / 改期
 // 航次以“当前发布号 + 起飞时刻”登记：服务端取该发布快照航线替换起飞时刻，
 // 与工作区已核准禁飞区重新审查，安全时落库航次编号/发布号/起飞时刻/航线快照。
 // 无发布、发布号已变、时刻无效或审查报错/冲突均拒绝且不留记录。
+// 已登记航次可改期：选取未结束航次 + 新起飞时刻（带上所见原时刻），服务端
+// 只替换该航次快照中的起飞时刻并用当前已核准禁飞区重审；原时刻被他页改动、
+// 航次不存在/已结束、时刻无效或审查报错/冲突时原时刻与快照不变。
 async function loadVoyages() {
   let r = null;
   try {
@@ -1331,8 +1339,94 @@ async function loadVoyages() {
   }
   if (r && r.ok) {
     voyages = r.voyages || [];
+    // 选中的航次已不存在或已结束时自动回到未选取（如他页刚结束该航次）
+    if (rescheduleId !== null
+        && !voyages.some((v) => v.id === rescheduleId && v.open)) {
+      rescheduleId = null;
+    }
   }
   renderVoyages();
+}
+
+// 改期被拒时的原因与明细（错误/冲突条目/并发明细）
+function renderRescheduleError(err) {
+  if (!err) return "";
+  let html = `<div class="error-line">⚠ 航次改期被拒绝：${esc(err.error || "未知原因")}</div>`;
+  for (const e of err.errors || []) {
+    html += `<div class="error-line">⚠ ${esc(e.message)}</div>`;
+  }
+  for (const e of err.entries || []) {
+    html += `<div class="entry-line">✈ ${esc(e.nfzName)} · 航段${e.segIndex + 1} ·
+      ${fmtTime(e.enterTime)}→${fmtTime(e.exitTime)} · 高度 ${e.altLow}–${e.altHigh}m</div>`;
+  }
+  if (err.details) {
+    for (const [k, v] of Object.entries(err.details)) {
+      const label = k === "departureTime" ? "原起飞时刻" : k;
+      html += `<div class="entry-line">${label}：读取时 ${esc(fmtTime(v.expected))} → 当前 ${esc(fmtTime(v.actual))}</div>`;
+    }
+  }
+  return html;
+}
+
+function renderVoyageReschedule() {
+  const box = $("#voyageRescheduleBox");
+  if (!box) return;
+  const openVoyages = voyages.filter((v) => v.open);
+  let html = "";
+  if (rescheduleErr) html += renderRescheduleError(rescheduleErr);
+  if (!openVoyages.length) {
+    box.innerHTML = html + `<div class="summary">暂无未结束航次可改期。</div>`;
+    return;
+  }
+  const selected = openVoyages.find((v) => v.id === rescheduleId) || null;
+  if (rescheduleId !== null && !selected) rescheduleId = null;
+  const options = openVoyages.map((v) =>
+    `<option value="${v.id}"${v.id === rescheduleId ? " selected" : ""}>` +
+    `航次 #${v.id}（发布 #${v.releaseSeq}，原时刻 ${fmtTime(v.departureTime)}）</option>`
+  ).join("");
+  html += `<div class="summary">选取未结束航次，输入新起飞时刻并带上所见原时刻提交：服务端保留航次编号/登记时间/原发布号，只替换该航次快照中的起飞时刻并用当前已核准禁飞区重审（沿用原航次航线几何，不跟随新发布）。</div>
+    <div class="form-row" style="margin-top:6px">
+      <label>改期航次</label>
+      <select id="rescheduleSel" class="reschedule-sel">
+        <option value="">— 请选择未结束航次 —</option>${options}
+      </select>
+    </div>`;
+  if (selected) {
+    html += `<div class="form-row">
+      <label>原起飞时刻</label>
+      <input type="datetime-local" step="60" disabled
+             value="${esc(selected.departureTime || "")}"
+             title="提交时携带此所见原时刻；已被他页改动将被拒绝">
+    </div>
+    <div class="form-row">
+      <label>新起飞时刻</label>
+      <input type="datetime-local" id="rescheduleDep" step="60" style="flex:1;min-width:0"
+             value="${esc(rescheduleDepDraft)}">
+    </div>
+    <div class="draft-actions">
+      <button id="btnVoyageReschedule">提交改期</button>
+    </div>`;
+  }
+  box.innerHTML = html;
+  const sel = $("#rescheduleSel");
+  if (sel) {
+    sel.onchange = () => {
+      const id = sel.value ? +sel.value : null;
+      rescheduleId = id;
+      // 显式切换航次即预填该航次当前时刻；被拒后未切换航次时输入原样保留
+      if (id !== null) {
+        const v = voyages.find((x) => x.id === id);
+        rescheduleDepDraft = (v && v.departureTime) || "";
+      }
+      rescheduleErr = null;
+      renderVoyages();
+    };
+  }
+  const dep = $("#rescheduleDep");
+  if (dep) {
+    dep.oninput = () => { rescheduleDepDraft = dep.value; };
+    $("#btnVoyageReschedule").onclick = submitVoyageReschedule;
+  }
 }
 
 function renderVoyageRegister(err) {
@@ -1412,11 +1506,15 @@ function renderVoyageList() {
   });
 }
 
-function renderVoyages(err) {
+function renderVoyages(registerErr) {
   const root = $("#voyageBox");
   if (!root) return;
-  root.innerHTML = `<div id="voyageRegisterBox"></div><div id="voyageListBox" style="margin-top:8px"></div>`;
-  renderVoyageRegister(err);
+  root.innerHTML =
+    `<div id="voyageRegisterBox"></div>` +
+    `<div id="voyageRescheduleBox" style="margin-top:10px;padding-top:8px;border-top:1px dashed #2a3a57"></div>` +
+    `<div id="voyageListBox" style="margin-top:8px"></div>`;
+  renderVoyageRegister(registerErr);
+  renderVoyageReschedule();
   renderVoyageList();
 }
 
@@ -1474,6 +1572,55 @@ async function endVoyage(id) {
   } else {
     toast("结束航次失败：" + (r.error || "未知原因"));
   }
+}
+
+async function submitVoyageReschedule() {
+  if (rescheduleId === null) {
+    rescheduleErr = { error: "请先选择要改期的未结束航次" };
+    renderVoyages();
+    return;
+  }
+  const depVal = rescheduleDepDraft || "";
+  if (!depVal) {
+    rescheduleErr = { error: "请先填写新起飞时刻" };
+    renderVoyages();
+    return;
+  }
+  // 所见原时刻取本页航次列表中该航次当前保存的时刻，随提交一起带上
+  const cur = voyages.find((v) => v.id === rescheduleId);
+  const seenTime = cur ? cur.departureTime : "";
+  let r;
+  try {
+    r = await api(`/api/voyages/${rescheduleId}/reschedule`, {
+      method: "POST",
+      body: JSON.stringify({
+        departureTime: depVal,
+        expectedDepartureTime: seenTime,
+      }),
+    });
+  } catch (e) {
+    rescheduleErr = { error: "改期请求失败：" + e };
+    renderVoyages();
+    return;
+  }
+  if (r.ok) {
+    rescheduleErr = null;
+    rescheduleDepDraft = r.voyage.departureTime || depVal;
+    toast(`航次 #${r.voyage.id} 已改期至 ${fmtTime(r.voyage.departureTime)}`);
+    await loadVoyages();
+    return;
+  }
+  // 航次不存在或已结束：先同步航次列表（选中项可能被清掉），再展示原因；
+  // 其余拒绝（原时刻已变/时刻无效/审查报错/冲突）不刷新列表，
+  // 被拒的新时刻输入与选中航次原样保留，仅在表单上方展示原因及明细
+  if (r.reason === "voyage_not_found" || r.reason === "voyage_ended") {
+    rescheduleErr = r;
+    await loadVoyages();
+    return;
+  }
+  rescheduleErr = r;
+  renderVoyages();
+  toast("航次改期被拒绝：" + (r.error || "未知原因"));
 }
 
 // ----------------------------------------------------------- 版本
